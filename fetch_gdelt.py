@@ -1,6 +1,8 @@
 """GDELT daily fetcher — runs on GitHub Actions (no external deps, stdlib only).
 
 Backfills 2017-01-01 -> today on first run, then incrementally appends.
+Per-series resume: each of the 12 series continues from its own last stored day,
+and the CSV is checkpointed after every series completes.
 Output: data/gdelt_daily.csv  (wide: date + 12 series columns)
 Exit code != 0 on hard failure so the Action run shows red.
 """
@@ -83,7 +85,7 @@ def fetch_series(name, start, end):
             agg.setdefault(k, []).append(v)
         for k, vs in agg.items():
             acc[k] = min(hi, max(lo, sum(vs) / len(vs)))
-        print(f"    {name} {cur} -> {chunk_end}: {len(agg)} days")
+        print(f"    {name} {cur} -> {chunk_end}: {len(agg)} days", flush=True)
         cur = chunk_end + timedelta(days=1)
         time.sleep(PACE_S)
     return acc
@@ -91,55 +93,63 @@ def fetch_series(name, start, end):
 
 def load_existing():
     if not os.path.exists(OUT):
-        return {}, None
+        return {}
     table = {}
     with open(OUT) as f:
         for row in csv.DictReader(f):
             table[row["date"]] = {s: row.get(s, "") for s in SERIES}
-    if not table:
-        return {}, None
-    return table, max(table)
+    return table
 
 
-def main():
-    os.makedirs("data", exist_ok=True)
-    today_utc = datetime.now(timezone.utc).date()
-    end = today_utc - timedelta(days=1)          # last COMPLETE UTC day
-    table, last = load_existing()
-    if last:
-        start = min(datetime.strptime(last, "%Y-%m-%d").date() - timedelta(days=REFRESH_TAIL_DAYS - 1),
-                    end)
-        print(f"incremental: {start} -> {end} (existing through {last})")
-    else:
-        start = START
-        print(f"backfill: {start} -> {end}")
-    if start > end:
-        print("nothing to fetch"); return
+def series_start(table, name, end):
+    """Resume point for one series: its own last stored day minus refresh tail."""
+    filled = [d for d, r in table.items() if r.get(name, "")]
+    if not filled:
+        return START
+    last = datetime.strptime(max(filled), "%Y-%m-%d").date()
+    return min(last - timedelta(days=REFRESH_TAIL_DAYS - 1), end)
 
-    failures = []
-    for name in SERIES:
-        print(f"[{name}]")
-        try:
-            vals = fetch_series(name, start, end)
-        except Exception as e:
-            print(f"  SERIES FAILED: {e}")
-            failures.append(name)
-            continue
-        for k, v in vals.items():
-            table.setdefault(k, {s: "" for s in SERIES})[name] = f"{v:.4f}"
-        time.sleep(PACE_S)
 
-    if not table:
-        sys.exit("no data at all — aborting")
+def write_csv(table):
     dates = sorted(table)
     with open(OUT, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["date"] + SERIES)
         for d in dates:
             w.writerow([d] + [table[d].get(s, "") for s in SERIES])
-    # completeness stats
+
+
+def main():
+    os.makedirs("data", exist_ok=True)
+    today_utc = datetime.now(timezone.utc).date()
+    end = today_utc - timedelta(days=1)          # last COMPLETE UTC day
+    table = load_existing()
+    print(f"existing rows: {len(table)}; target end: {end}", flush=True)
+
+    failures = []
+    for name in SERIES:
+        start_s = series_start(table, name, end)
+        if start_s > end:
+            print(f"[{name}] up to date")
+            continue
+        print(f"[{name}] {start_s} -> {end}", flush=True)
+        try:
+            vals = fetch_series(name, start_s, end)
+        except Exception as e:
+            print(f"  SERIES FAILED: {e}", flush=True)
+            failures.append(name)
+            continue
+        for k, v in vals.items():
+            table.setdefault(k, {s: "" for s in SERIES})[name] = f"{v:.4f}"
+        write_csv(table)                          # checkpoint after every series
+        time.sleep(PACE_S)
+
+    if not table:
+        sys.exit("no data at all — aborting")
+    write_csv(table)
+    dates = sorted(table)
     n = len(dates)
-    empty = sum(1 for d in dates for s in SERIES if table[d].get(s, "") == "")
+    empty = sum(1 for d in dates for s in SERIES if not table[d].get(s, ""))
     print(f"wrote {OUT}: {n} days ({dates[0]} -> {dates[-1]}), empty cells: {empty}/{n*len(SERIES)}")
     if failures:
         sys.exit(f"failed series this run: {failures}")
