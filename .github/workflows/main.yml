@@ -9,10 +9,14 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: fetch-data
+  cancel-in-progress: false
+
 jobs:
   fetch:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
 
@@ -24,12 +28,15 @@ jobs:
         run: python fetch_gdelt.py
 
       - name: Fetch NAS100 prices
+        if: always()
         run: python fetch_prices.py
 
       - name: Commit refreshed data
+        if: always()
         run: |
           git config user.name "data-bot"
           git config user.email "data-bot@users.noreply.github.com"
           git add data/
           git diff --cached --quiet || git commit -m "data refresh $(date -u +%FT%TZ)"
+          git pull --rebase --autostash origin main || true
           git push
